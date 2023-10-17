@@ -1,0 +1,16 @@
+[package]
+name = "bigfoot-sim"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+overflow-checks = false
+
+[dependencies]
+gmp-mpfr-sys = { version = ">=1.6.1,<1.7", default-features = false }
