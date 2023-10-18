@@ -1,7 +1,8 @@
 use gmp_mpfr_sys::gmp::{self, mpz_t};
 use std::{
+    env,
     fs::OpenOptions,
-    io::{self, prelude::*, BufWriter},
+    io::{self, prelude::*, BufWriter, LineWriter},
     mem::{self, MaybeUninit},
     os::raw::c_ulong,
     ptr::NonNull,
@@ -79,12 +80,12 @@ impl Integer {
 
 fn main() -> io::Result<()> {
     const _: () = assert!(mem::size_of::<c_ulong>() == 8, "get a better OS");
-    let mut log_file = BufWriter::new(
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/dev/null")?,
-    );
+    let filename = env::args_os().nth(1).unwrap();
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(filename)?;
+    let mut log_file = BufWriter::new(LineWriter::new(log_file));
     let mut a = 2_i32;
     let mut b = Integer::new();
     let mut last_end = 0;
@@ -103,10 +104,11 @@ fn main() -> io::Result<()> {
             if a <= 1 {
                 break 'outer;
             }
-            let (tmp, ov1) = end.overflowing_shl(8);
-            let (tmp, ov2) = tmp.overflowing_add(b_off as u64);
-            end = tmp;
-            assert!(!ov1 && !ov2, "it's odd that this never seems to overflow");
+            let (tmp, ov) = end.overflowing_mul(256);
+            if ov {
+                unsafe { gmp::mpz_add_ui(b_raw, b_raw, 1) };
+            }
+            end = tmp + b_off as u64;
         }
         b.push_limb(end);
         last_end = end;
