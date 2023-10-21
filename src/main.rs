@@ -43,7 +43,7 @@ impl Integer {
         }
     }
 
-    fn as_raw_mut(&mut self) -> *mut mpz_t {
+    fn as_raw(&mut self) -> *mut mpz_t {
         let capacity = self.limbs.len();
         let alloc = self.value.alloc as usize;
         let limbs = &mut self.limbs[capacity - alloc..];
@@ -51,21 +51,60 @@ impl Integer {
         &mut self.value
     }
 
-    fn push_limb(&mut self, value: u64) {
+    fn reserve(&mut self, additional: usize) {
         let mut capacity = self.limbs.len();
         let mut alloc = self.value.alloc as usize;
-        if alloc == capacity {
-            self.value.alloc = self.value.size;
-            alloc = self.value.alloc as usize;
-            capacity *= 2;
-            let mut new_limbs = Vec::with_capacity(capacity);
-            unsafe { new_limbs.set_len(capacity - alloc) };
-            new_limbs.extend_from_slice(&self.limbs[..alloc]);
-            self.limbs = new_limbs.into_boxed_slice();
+        if alloc + additional <= capacity {
+            return;
         }
-        self.limbs[capacity - alloc - 1].write(value);
-        self.value.alloc += 1;
-        self.value.size += 1;
+        let old_limbs = &self.limbs[capacity - alloc..];
+        self.value.alloc = self.value.size;
+        capacity *= 2;
+        alloc = self.value.alloc as usize;
+        let mut new_limbs = Vec::with_capacity(capacity);
+        unsafe { new_limbs.set_len(capacity - alloc) };
+        new_limbs.extend_from_slice(&old_limbs[..alloc]);
+        self.limbs = new_limbs.into_boxed_slice();
+    }
+
+    fn push_u128(&mut self, value: u128) {
+        self.reserve(2);
+        let capacity = self.limbs.len();
+        let alloc = self.value.alloc as usize;
+        self.limbs[capacity - alloc - 2].write(value as u64);
+        self.limbs[capacity - alloc - 1].write((value >> 64) as u64);
+        self.value.alloc += 2;
+        self.value.size += 2;
+    }
+}
+
+struct Int128 {
+    inner: u128,
+    value: mpz_t,
+}
+
+impl Int128 {
+    fn new(value: u128) -> Self {
+        let size = if value == 0 {
+            0
+        } else if value < 1 << 64 {
+            1
+        } else {
+            2
+        };
+        Self {
+            inner: value,
+            value: mpz_t {
+                alloc: 2,
+                size,
+                d: NonNull::dangling(),
+            },
+        }
+    }
+
+    fn as_raw(&mut self) -> *mut mpz_t {
+        self.value.d = NonNull::from(&mut self.inner).cast();
+        &mut self.value
     }
 }
 
@@ -77,28 +116,33 @@ fn main() -> io::Result<()> {
         .append(true)
         .open(filename)?;
     let mut log_file = BufWriter::new(LineWriter::new(log_file));
+    let mut divisor = Int128::new(81_u128.pow(16));
+    let divisor_raw = divisor.as_raw();
     let mut a = 2_i32;
     let mut b = Integer::new();
+    let mut end = Int128::new(0);
     let mut last_end = 0;
     'outer: for i in 0_usize.. {
-        let b_raw = b.as_raw_mut();
-        let mut end = unsafe { gmp::mpz_tdiv_q_ui(b_raw, b_raw, 81_u64.pow(8)) };
+        let b_raw = b.as_raw();
+        let end_raw = end.as_raw();
+        unsafe { gmp::mpz_tdiv_qr(b_raw, end_raw, b_raw, divisor_raw) };
+        let end = &mut end.inner;
         writeln!(&mut log_file, "{i} {a} {last_end} {end}")?;
         if i % 16 == 0 {
-            println!("iter {}: a = {a}, b % 81^8 = {end}", i * 4 * 8);
+            println!("iter {}: a = {a}, b % 81^16 = {end}", i * 4 * 16);
         }
-        for _ in 0..8 {
-            let rem = end % 81;
-            end /= 81;
+        for _ in 0..16 {
+            let rem = *end % 81;
+            *end /= 81;
             let (a_off, b_off) = TABLE.0[rem as usize];
             a += a_off;
             if a <= 1 {
                 break 'outer;
             }
-            end = (end << 8) + b_off as u64;
+            *end = (*end << 8) + b_off as u128;
         }
-        b.push_limb(end);
-        last_end = end;
+        b.push_u128(*end);
+        last_end = *end;
     }
     Ok(())
 }
