@@ -13,4 +13,5 @@ lto = "fat"
 overflow-checks = false
 
 [dependencies]
-gmp-mpfr-sys = { version = ">=1.6.1,<1.7", default-features = false }
+bytemuck = "1.14.0"
+rayon = "1.8.0"
