@@ -125,15 +125,11 @@ impl Integer {
         self.pages
             .par_iter_mut()
             .enumerate()
-            .fold_chunks_with(
-                chunk_size,
-                (usize::MAX, 0),
-                move |(_, carry), (i, page)| {
-                    let start = if i == 0 { start } else { 0 };
-                    let carry = multiply_limbs_256(&mut page.0[start..], carry);
-                    (i + 1, carry)
-                },
-            )
+            .fold_chunks_with(chunk_size, (usize::MAX, 0), move |(_, carry), (i, page)| {
+                let start = if i == 0 { start } else { 0 };
+                let carry = multiply_limbs_256(&mut page.0[start..], carry);
+                (i + 1, carry)
+            })
             .collect_into_vec(carries);
         for &(i, carry) in &carries[..] {
             self.add(i, 0, carry);
@@ -196,7 +192,9 @@ fn main() -> io::Result<()> {
     if let Some(restore_file) = args.next().map(File::open) {
         restore(&mut i, &mut a, &mut b, restore_file?)?;
     }
-    let mut save_file = save_filename.map(File::create).transpose()?;
+    let mut save_file = save_filename
+        .map(|filename| OpenOptions::new().create(true).write(true).open(filename))
+        .transpose()?;
     let mut carries = Vec::new();
     let mut last_end = 0;
     let now = Instant::now();
