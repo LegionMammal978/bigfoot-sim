@@ -1,13 +1,14 @@
-use rayon::prelude::*;
+use gmp_mpfr_sys::gmp;
 use std::{
-    arch::asm,
-    collections::VecDeque,
+    cmp::Ordering,
     env,
     fs::{File, OpenOptions},
-    io::{self, prelude::*, BufWriter, LineWriter},
-    slice,
+    io::{prelude::*, BufWriter, LineWriter},
+    iter,
     time::{Duration, Instant},
 };
+
+const _: gmp::limb_t = 0_u64; // assert 64-bit limb size
 
 #[repr(C, align(4096))]
 struct Align4096<T>(T);
@@ -24,208 +25,152 @@ const TABLE: Align4096<[(i32, u32); 81]> = Align4096([
     (0, 170), (0, 173), (3, 175), (1, 179), (1, 182), (-1, 186), (0, 189),
     (0, 192), (0, 195), (1, 198), (1, 201), (-1, 205), (2, 207), (2, 210),
     (0, 214), (1, 217), (1, 220), (-1, 224), (2, 226), (2, 229), (0, 233),
-    (-2, 237), (1, 239), (1, 242), (2, 245), (2, 248), (0, 252), (1, 255)
+    (-2, 237), (1, 239), (1, 242), (2, 245), (2, 248), (0, 252), (1, 255),
 ]);
 
-// adapted from https://gmplib.org/~tege/division-paper.pdf
-fn multiply_limbs_256(limbs: &mut [u128], mut carry: u128) -> u128 {
-    const D: u128 = 81_u128.pow(16) << 26;
-    const D1: u64 = (D >> 64) as u64;
-    const D0: u64 = D as u64;
-    const V: u64 = 0x7a0a91194ed93d67;
-    let i2p = |x: u128| ((x >> 64) as u64, x as u64);
-    let p2i = |x: u64, y: u64| (x as u128) << 64 | y as u128;
-    let div_3by2 = |u21: u128, u0: u64| -> (u128, u64) {
-        let (u2, u1) = i2p(u21);
-        let q = u2 as u128 * V as u128;
-        let (mut q1, q0) = i2p(q + u21);
-        let r1 = u1 - q1 * D1;
-        let t = q1 as u128 * D0 as u128;
-        let mut r = p2i(r1, u0) - t - D;
-        q1 += 1;
-        if i2p(r).0 >= q0 {
-            q1 -= 1;
-            r += D;
-        }
-        if i2p(r).0 >= D1 {
-            // generate a real branch instead of conditional moves
-            unsafe { asm!("", options(nomem, preserves_flags, nostack)) };
-            if r >= D {
-                q1 += 1;
-                r -= D;
-            }
-        }
-        (r, q1)
-    };
-    for limb in limbs {
-        let r = *limb << 26 | carry >> 102;
-        let (u0a, u0b) = i2p(carry << 26);
-        let (r, q1a) = div_3by2(r, u0a);
-        let (r, q1b) = div_3by2(r, u0b);
-        *limb = r >> 26;
-        carry = p2i(q1a, q1b);
+fn cmp_wide(x: &[u64], y: &[u64]) -> Ordering {
+    if x.len() < y.len() {
+        return Ordering::Less;
     }
-    carry
+    if x.len() > y.len() {
+        return Ordering::Greater;
+    }
+    iter::zip(x, y)
+        .rev()
+        .map(|(x, y)| x.cmp(y))
+        .find(|o| o.is_ne())
+        .unwrap_or(Ordering::Equal)
 }
 
-type Page = Align4096<[u128; 256]>;
-
-struct Integer {
-    pages: VecDeque<Page>,
-    start: usize,
+fn step_16(mut end: u128, a: &mut i64) -> u128 {
+    for _ in 0..16 {
+        let rem = end % 81;
+        end /= 81;
+        let (a_off, b_off) = TABLE.0[rem as usize];
+        *a += a_off as i64;
+        assert!(*a >= 2, "a miracle occurred");
+        end = (end << 8) + b_off as u128;
+    }
+    end
 }
 
-impl Integer {
-    fn new() -> Self {
+struct State {
+    i: u64,
+    a: i64,
+    buffer: Vec<u64>,
+    pow81: Vec<Box<[u64]>>,
+    log_file: BufWriter<LineWriter<File>>,
+    last_end: u128,
+    next_status: Instant,
+}
+
+impl State {
+    fn new(log_file: File) -> Self {
+        let pow1 = Box::new([81_u64.pow(8)]);
+        let pow2 = Box::new([81_u128.pow(16) as u64, (81_u128.pow(16) >> 64) as u64]);
         Self {
-            pages: [Align4096([0; 256])].into(),
-            start: 0,
+            i: 0_u64,
+            a: 2_i64,
+            buffer: vec![0_u64; 5],
+            pow81: vec![pow1, pow2],
+            log_file: BufWriter::new(LineWriter::new(log_file)),
+            last_end: 0_u128,
+            next_status: Instant::now(),
         }
-    }
-
-    fn pop(&mut self) -> u128 {
-        let limb = self.pages[0].0[self.start];
-        self.start += 1;
-        if self.start >= 256 {
-            self.start = 0;
-            self.pages.pop_front().unwrap();
-        }
-        limb
-    }
-
-    fn add(&mut self, i: usize, mut j: usize, mut value: u128) {
-        if value == 0 {
-            return;
-        }
-        for page in self.pages.iter_mut().skip(i) {
-            while j < page.0.len() {
-                let (mut sum, ov) = page.0[j].overflowing_add(value);
-                if ov {
-                    sum -= 81_u128.pow(16);
-                }
-                page.0[j] = sum % 81_u128.pow(16);
-                value = sum / 81_u128.pow(16) + ov as u128;
-                if value == 0 {
-                    return;
-                }
-                j += 1;
-            }
-            j = 0;
-        }
-        let mut page = Align4096([0; 256]);
-        page.0[0] = value % 81_u128.pow(16);
-        page.0[1] = value / 81_u128.pow(16);
-        self.pages.push_back(page);
-    }
-
-    fn multiply_256(&mut self, carries: &mut Vec<(usize, u128)>) {
-        let len = self.pages.len();
-        let chunk_size = len.div_ceil(rayon::current_num_threads() * 16);
-        let start = self.start;
-        self.pages
-            .par_iter_mut()
-            .enumerate()
-            .fold_chunks_with(chunk_size, (usize::MAX, 0), move |(_, carry), (i, page)| {
-                let start = if i == 0 { start } else { 0 };
-                let carry = multiply_limbs_256(&mut page.0[start..], carry);
-                (i + 1, carry)
-            })
-            .collect_into_vec(carries);
-        for &(i, carry) in &carries[..] {
-            self.add(i, 0, carry);
-        }
-    }
-
-    fn push(&mut self, limb: u128, carries: &mut Vec<(usize, u128)>) {
-        self.multiply_256(carries);
-        self.add(0, self.start, limb);
     }
 }
 
-fn save(i: u64, a: i64, b: &Integer, save_file: &mut Option<File>) -> io::Result<()> {
-    let Some(save_file) = save_file else {
-        return Ok(());
+enum Seq {
+    First,
+    Second,
+}
+
+fn step_wide_level0(state: &mut State, start: usize) {
+    let buf = &mut state.buffer[start..];
+    let end = buf[0] as u128 | (buf[1] as u128) << 64;
+    let State { i, a, last_end, .. } = *state;
+    writeln!(&mut state.log_file, "{i} {a} {last_end} {end}").unwrap();
+    let now = Instant::now();
+    if now > state.next_status {
+        state.next_status = now + Duration::from_secs(1);
+        println!("iter {}: a = {a}, b % 81^16 = {end}", i * 4 * 16);
+    }
+    let end = step_16(end, &mut state.a);
+    state.i += 1;
+    state.last_end = end;
+    buf[2] = end as u64;
+    buf[3] = (end >> 64) as u64;
+}
+
+fn step_wide(state: &mut State, level: usize, seq: Seq, start: usize) {
+    assert!(level != 0);
+    let buf = &mut state.buffer[start..];
+    let (len256, len81) = (1_usize << level, state.pow81[level].len());
+    let (num, quot) = buf.split_at_mut(2 * len256);
+    let (num_len, quot_len) = match seq {
+        Seq::First => (state.pow81[level + 1].len(), len81),
+        Seq::Second => (len256 + len81, len256),
     };
-    save_file.rewind()?;
-    save_file.write_all(bytemuck::bytes_of(&i))?;
-    save_file.write_all(bytemuck::bytes_of(&a))?;
-    let b_len = b.pages.len() * 4096 - b.start * 16;
-    save_file.write_all(bytemuck::bytes_of(&b_len))?;
-    let slices = b.pages.as_slices();
-    let slice = unsafe { slice::from_raw_parts(slices.0.as_ptr().cast(), slices.0.len() * 4096) };
-    save_file.write_all(&slice[b.start * 16..])?;
-    let slice = unsafe { slice::from_raw_parts(slices.1.as_ptr().cast(), slices.1.len() * 4096) };
-    save_file.write_all(slice)?;
-    if let Err(err) = save_file.sync_data() {
-        if err.kind() != io::ErrorKind::InvalidInput {
-            return Err(err);
-        }
+    let saved = quot[quot_len]; // limb is clobbered by mpn_tdiv_qr()
+    let (num_ptr, quot_ptr) = (num.as_mut_ptr(), quot.as_mut_ptr());
+    let den_ptr = state.pow81[level].as_ptr();
+    unsafe {
+        gmp::mpn_tdiv_qr(
+            quot_ptr,
+            num_ptr,
+            0,
+            num_ptr,
+            num_len as gmp::size_t,
+            den_ptr,
+            len81 as gmp::size_t,
+        );
     }
-    Ok(())
+    quot[quot_len] = saved;
+    if level > 1 {
+        step_wide(state, level - 1, Seq::First, start);
+        step_wide(state, level - 1, Seq::Second, start + len256 / 2);
+    } else {
+        step_wide_level0(state, start);
+    }
 }
 
-fn restore(i: &mut u64, a: &mut i64, b: &mut Integer, mut restore_file: File) -> io::Result<()> {
-    restore_file.read_exact(bytemuck::bytes_of_mut(i))?;
-    restore_file.read_exact(bytemuck::bytes_of_mut(a))?;
-    let mut b_len = 0_usize;
-    restore_file.read_exact(bytemuck::bytes_of_mut(&mut b_len))?;
-    let mut pages = Vec::new();
-    pages.resize_with(b_len.div_ceil(4096), || Align4096([0; 256]));
-    let slice = unsafe { slice::from_raw_parts_mut(pages.as_mut_ptr().cast(), b_len) };
-    restore_file.read_exact(slice)?;
-    b.pages = pages.into();
-    b.start = 0;
-    Ok(())
-}
-
-fn main() -> io::Result<()> {
+fn main() {
     let mut args = env::args_os().fuse().skip(1);
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(args.next().unwrap())?;
-    let mut log_file = BufWriter::new(LineWriter::new(log_file));
-    let mut i = 0_u64;
-    let mut a = 2_i64;
-    let mut b = Integer::new();
-    let save_filename = args.next();
-    if let Some(restore_file) = args.next().map(File::open) {
-        restore(&mut i, &mut a, &mut b, restore_file?)?;
-    }
-    let mut save_file = save_filename
-        .map(|filename| OpenOptions::new().create(true).write(true).open(filename))
-        .transpose()?;
-    let mut carries = Vec::new();
-    let mut last_end = 0;
-    let now = Instant::now();
-    let mut next_save = now + Duration::from_secs(300);
-    let mut next_status = now + Duration::from_secs(1);
+        .open(args.next().unwrap())
+        .unwrap();
+    let mut state = State::new(log_file);
     loop {
-        let now = Instant::now();
-        if now > next_save {
-            next_save = now + Duration::from_secs(300);
-            if save(i, a, &b, &mut save_file).is_err() {
-                eprintln!("warning: could not save state to file");
+        let level = state.pow81.len() - 1;
+        let (len256, len81) = (1_usize << level, state.pow81[level].len());
+        let mut top = len256;
+        while top >= len81 && state.buffer[top - 1] == 0 {
+            top -= 1;
+        }
+        if cmp_wide(&state.buffer[..top], &state.pow81[level]).is_lt() {
+            if level > 1 {
+                step_wide(&mut state, level - 1, Seq::First, 0);
+                step_wide(&mut state, level - 1, Seq::Second, len256 / 2);
+            } else {
+                step_wide_level0(&mut state, 0);
             }
-        }
-        let mut end = b.pop();
-        writeln!(&mut log_file, "{i} {a} {last_end} {end}")?;
-        if now > next_status {
-            next_status = now + Duration::from_secs(1);
-            println!("iter {}: a = {a}, b % 81^16 = {end}", i * 4 * 16);
-        }
-        for _ in 0..16 {
-            let rem = end % 81;
-            end /= 81;
-            let (a_off, b_off) = TABLE.0[rem as usize];
-            a += a_off as i64;
-            if a <= 1 {
-                return Ok(());
+            let (dst, src) = state.buffer.split_at_mut(len256);
+            dst.copy_from_slice(&src[..len256]);
+        } else {
+            let mut dst: Vec<u64> = Vec::with_capacity(2 * len81);
+            let (src_ptr, dst_ptr) = (state.pow81[level].as_ptr(), dst.as_mut_ptr());
+            unsafe {
+                gmp::mpn_sqr(dst_ptr, src_ptr, len81 as gmp::size_t);
+                dst.set_len(2 * len81);
             }
-            end = (end << 8) + b_off as u128;
+            if *dst.last().unwrap() == 0 {
+                dst.pop();
+            }
+            state.pow81.push(dst.into_boxed_slice());
+            state.buffer[len256..2 * len256].fill(0);
+            state.buffer.resize(4 * len256 + 1, 0);
         }
-        b.push(end, &mut carries);
-        last_end = end;
-        i += 1;
     }
 }

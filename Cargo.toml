@@ -1,6 +1,6 @@
 [package]
 name = "bigfoot-sim"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "CC0-1.0"
 
@@ -13,5 +13,4 @@ lto = "fat"
 overflow-checks = false
 
 [dependencies]
-bytemuck = "1.14.0"
-rayon = "1.8.0"
+gmp-mpfr-sys = { version = ">=1.6.1,<1.7", default-features = false }
