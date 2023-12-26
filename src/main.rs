@@ -3,9 +3,12 @@ use std::{
     cmp::Ordering,
     env,
     fs::{File, OpenOptions},
+    hint,
     io::{prelude::*, BufWriter, LineWriter},
     iter,
-    time::{Duration, Instant},
+    sync::atomic::{self, AtomicI64, AtomicU64, AtomicUsize, Ordering::*},
+    thread,
+    time::Duration,
 };
 
 const _: gmp::limb_t = 0_u64; // assert 64-bit limb size
@@ -61,7 +64,6 @@ struct State {
     pow81: Vec<Box<[u64]>>,
     log_file: BufWriter<LineWriter<File>>,
     last_end: u128,
-    next_status: Instant,
 }
 
 impl State {
@@ -75,7 +77,26 @@ impl State {
             pow81: vec![pow1, pow2],
             log_file: BufWriter::new(LineWriter::new(log_file)),
             last_end: 0_u128,
-            next_status: Instant::now(),
+        }
+    }
+}
+
+struct Stats {
+    i2: AtomicU64,
+    level: AtomicUsize,
+    a: AtomicI64,
+    end0: AtomicU64,
+    end1: AtomicU64,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            i2: AtomicU64::new(0),
+            level: AtomicUsize::new(0),
+            a: AtomicI64::new(2),
+            end0: AtomicU64::new(0),
+            end1: AtomicU64::new(0),
         }
     }
 }
@@ -85,25 +106,29 @@ enum Seq {
     Second,
 }
 
-fn step_wide_level0(state: &mut State, start: usize) {
+fn step_wide_level0(state: &mut State, stats: &Stats, start: usize) {
+    stats.level.store(0, Relaxed);
     let buf = &mut state.buffer[start..];
     let end = buf[0] as u128 | (buf[1] as u128) << 64;
     let State { i, a, last_end, .. } = *state;
     writeln!(&mut state.log_file, "{i} {a} {last_end} {end}").unwrap();
-    let now = Instant::now();
-    if now > state.next_status {
-        state.next_status = now + Duration::from_secs(1);
-        println!("iter {}: a = {a}, b % 81^16 = {end}", i * 4 * 16);
-    }
     let end = step_16(end, &mut state.a);
     state.i += 1;
     state.last_end = end;
     buf[2] = end as u64;
     buf[3] = (end >> 64) as u64;
+    stats.i2.store(2 * state.i - 1, Relaxed);
+    atomic::fence(Release);
+    stats.a.store(state.a, Relaxed);
+    stats.end0.store(buf[2], Relaxed);
+    stats.end1.store(buf[3], Relaxed);
+    atomic::fence(Release);
+    stats.i2.store(2 * state.i, Relaxed);
 }
 
-fn step_wide(state: &mut State, level: usize, seq: Seq, start: usize) {
+fn step_wide(state: &mut State, stats: &Stats, level: usize, seq: Seq, start: usize) {
     assert!(level != 0);
+    stats.level.store(level, Relaxed);
     let buf = &mut state.buffer[start..];
     let (len256, len81) = (1_usize << level, state.pow81[level].len());
     let (num, quot) = buf.split_at_mut(2 * len256);
@@ -127,23 +152,17 @@ fn step_wide(state: &mut State, level: usize, seq: Seq, start: usize) {
     }
     quot[quot_len] = saved;
     if level > 1 {
-        step_wide(state, level - 1, Seq::First, start);
-        step_wide(state, level - 1, Seq::Second, start + len256 / 2);
+        step_wide(state, stats, level - 1, Seq::First, start);
+        step_wide(state, stats, level - 1, Seq::Second, start + len256 / 2);
     } else {
-        step_wide_level0(state, start);
+        step_wide_level0(state, stats, start);
     }
 }
 
-fn main() {
-    let mut args = env::args_os().fuse().skip(1);
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(args.next().unwrap())
-        .unwrap();
-    let mut state = State::new(log_file);
+fn main_loop(state: &mut State, stats: &Stats) {
     loop {
         let level = state.pow81.len() - 1;
+        stats.level.store(level, Relaxed);
         let (len256, len81) = (1_usize << level, state.pow81[level].len());
         let mut top = len256;
         while top >= len81 && state.buffer[top - 1] == 0 {
@@ -151,10 +170,10 @@ fn main() {
         }
         if cmp_wide(&state.buffer[..top], &state.pow81[level]).is_lt() {
             if level > 1 {
-                step_wide(&mut state, level - 1, Seq::First, 0);
-                step_wide(&mut state, level - 1, Seq::Second, len256 / 2);
+                step_wide(state, stats, level - 1, Seq::First, 0);
+                step_wide(state, stats, level - 1, Seq::Second, len256 / 2);
             } else {
-                step_wide_level0(&mut state, 0);
+                step_wide_level0(state, stats, 0);
             }
             let (dst, src) = state.buffer.split_at_mut(len256);
             dst.copy_from_slice(&src[..len256]);
@@ -173,4 +192,68 @@ fn main() {
             state.buffer.resize(4 * len256 + 1, 0);
         }
     }
+}
+
+fn status_loop(stats: &Stats) {
+    let mut last_i2 = 0;
+    let mut last_level = 0;
+    let mut level_secs = 0_usize;
+    loop {
+        let mut i2 = stats.i2.load(Relaxed);
+        let (mut level, mut a, mut end0, mut end1);
+        loop {
+            while i2 % 2 != 0 {
+                hint::spin_loop();
+                i2 = stats.i2.load(Relaxed);
+            }
+            atomic::fence(Acquire);
+            level = stats.level.load(Relaxed);
+            a = stats.a.load(Relaxed);
+            end0 = stats.end0.load(Relaxed);
+            end1 = stats.end1.load(Relaxed);
+            atomic::fence(Acquire);
+            let next_i2 = stats.i2.load(Relaxed);
+            if next_i2 == i2 {
+                break;
+            }
+            i2 = next_i2;
+        }
+        if i2 == last_i2 {
+            if level != last_level {
+                level_secs = 0;
+            }
+            let pow = 8_u64 << level;
+            if level_secs == 0 {
+                println!("iter {}: level {level}, den = 81^{pow}", i2 * 4 * 8);
+            } else {
+                println!(
+                    "iter {}: level {level}, den = 81^{pow} ({level_secs}s)",
+                    i2 * 4 * 8
+                );
+            }
+            level_secs += 1;
+        } else {
+            let end = (end1 as u128) << 64 | end0 as u128;
+            println!("iter {}: a = {a}, b % 81^16 = {end}", i2 * 4 * 8);
+            level_secs = 0;
+        }
+        last_i2 = i2;
+        last_level = level;
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn main() {
+    let mut args = env::args_os().fuse().skip(1);
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(args.next().unwrap())
+        .unwrap();
+    let mut state = State::new(log_file);
+    let stats = Stats::new();
+    thread::scope(|s| {
+        s.spawn(|| status_loop(&stats));
+        main_loop(&mut state, &stats);
+    });
 }
